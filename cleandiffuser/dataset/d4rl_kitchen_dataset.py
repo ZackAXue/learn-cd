@@ -7,7 +7,7 @@ from cleandiffuser.dataset.base_dataset import BaseDataset
 from cleandiffuser.utils import GaussianNormalizer, dict_apply
 
 
-class D4RLKitchenDataset(BaseDataset):
+class  D4RLKitchenDataset(BaseDataset):
     """ **D4RL-Kitchen Sequential Dataset**
 
     torch.utils.data.Dataset wrapper for D4RL-Kitchen dataset.

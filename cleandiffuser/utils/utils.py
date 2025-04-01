@@ -481,3 +481,64 @@ def loop_dataloader(dl):
     while True:
         for b in dl:
             yield b
+
+# ----------------------- Bits Diffusion -----------------------
+
+# --------------------------------------------------------------
+def bw_create_tokenizer(big_text, save_path):
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+    from transformers import PreTrainedTokenizerFast
+
+    # 1. Split on whitespace only
+    all_tokens = big_text.split()
+
+    # 2. Build vocab from these whitespace-chunks
+    vocab = {}
+    for token in all_tokens:
+        if token not in vocab:
+            vocab[token] = len(vocab)
+
+    # 3. Add special tokens
+    if "[UNK]" not in vocab:
+        vocab["[UNK]"] = len(vocab)
+    if "[PAD]" not in vocab:
+        vocab["[PAD]"] = len(vocab)
+    if "[MOTION]" not in vocab:
+        vocab["[MOTION]"] = len(vocab)
+
+    # 4. Create WordLevel tokenizer
+    tokenizer = Tokenizer(WordLevel(vocab=vocab, unk_token="[UNK]"))
+    tokenizer.pre_tokenizer = Whitespace()
+
+    # 5. Wrap & save
+    tokenizer_fast = PreTrainedTokenizerFast(
+        tokenizer_object=tokenizer,
+        unk_token="[UNK]",
+        pad_token="[PAD]"
+    )
+    tokenizer_fast.save_pretrained(save_path)
+
+def text_to_bits(text, tokenizer, n_bits=16):
+    """Tokenize text and convert tokens to binary bits."""
+    # Tokenize without special tokens
+    tokens = tokenizer(text, add_special_tokens=False, return_tensors="np")["input_ids"].squeeze()
+    bits = int2bits(tokens, n=n_bits, out_dtype=np.int32)
+    bits = bits2range(bits)
+    return bits
+
+def int2bits(x, n, out_dtype=None):
+    """
+    Convert an integer x in (...) into bits in (..., n).
+    Order of bits (LSB)
+    """
+    x = np.right_shift(np.expand_dims(x, -1), np.arange(n))
+    x = np.mod(x, 2)
+    if out_dtype and out_dtype != x.dtype:
+        x = x.astype(out_dtype)
+    return x
+
+def bits2range(x):
+    # convert the 0 in x to -1
+    return 2 * x - 1

@@ -77,7 +77,6 @@ def pipeline(args):
         log = {"avg_loss_diffusion": 0., "avg_loss_classifier": 0.}
 
         for batch in loop_dataloader(dataloader):
-            import pdb; pdb.set_trace()
 
             obs = batch["obs"]["state"].to(args.device)
             act = batch["act"].to(args.device)
