@@ -187,6 +187,7 @@ class BaseDiffusionSDE(DiffusionModel):
                 if pred is None or pred_uncond is None:
                     b = xt.shape[0]
                     repeat_dim = [2 if i == 0 else 1 for i in range(xt.dim())]
+                    # Two samples includes condition and uncondition
                     condition = torch.cat([condition, torch.zeros_like(condition)], 0)
                     pred_all = model["diffusion"](
                         xt.repeat(*repeat_dim), t.repeat(2), condition)
@@ -891,6 +892,7 @@ class ContinuousDiffusionSDE(BaseDiffusionSDE):
                         (alphas[i - 1] / alphas[i]) * (xt - sigmas[i] * eps_theta) +
                         (sigmas[i - 1] ** 2 - stds[i] ** 2 + 1e-8).sqrt() * eps_theta)
                 if i > 1:
+                    # add noise to ensure the randomness of sampling
                     xt += (stds[i] * torch.randn_like(xt))
 
             elif solver == "ddim":
@@ -950,3 +952,4 @@ class ContinuousDiffusionSDE(BaseDiffusionSDE):
             xt = xt.clip(self.x_min, self.x_max)
 
         return xt, log
+

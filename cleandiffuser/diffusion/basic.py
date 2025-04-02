@@ -101,6 +101,3 @@ class DiffusionModel:
         checkpoint = torch.load(path, map_location=self.device)
         self.model.load_state_dict(checkpoint["model"])
         self.model_ema.load_state_dict(checkpoint["model_ema"])
-        
-
-

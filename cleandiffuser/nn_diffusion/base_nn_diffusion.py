@@ -14,8 +14,12 @@ class BaseNNDiffusion(nn.Module):
      The second input is the denoising time step, which can be either as a discrete variable
      or a continuous variable, specified by the parameter `discrete_t`.
      The third input is the condition embedding that has been processed through the `nn_condition`.
+     
      In the general case, we assume that there may be multiple conditions,
      which are inputted as a tensor dictionary, or a single condition, directly inputted as a tensor.
+
+    The forward with corss-attention is implemented in the child class.
+    For example, class PearceMlp(BaseNNDiffusion)
     """
 
     def __init__(

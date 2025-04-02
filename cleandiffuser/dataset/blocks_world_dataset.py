@@ -48,8 +48,8 @@ class BlocksWorldDataset(BaseDataset):
         batch["obs"]["init_coords_ee"]: (T_init,2)
         batch["obs"]["goal_coords_ee"]: (T_goal,2)
         batch["hl_discrete_action_seq"]: (8,6)
-        batch["ll_traj"]: (40,3)
-        batch["segment_idx"]: e.g. [(0,5), (5,10), ...]
+        batch["ll_traj"]: (48,3)
+        batch["segment_idx"]: e.g. [(0,6), (6,12), ...]
         batch["act"], batch["rew"], batch["val"] (如果需要)
     """
     def __init__(
