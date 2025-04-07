@@ -390,6 +390,9 @@ class JdmContinuousDiffusionSDE(BaseDiffusionSDE):
         
         # Set up LL mask and constraints
         self.fix_mask_ll = torch.zeros(1) if fix_mask_ll is None else torch.as_tensor(fix_mask_ll, device=self.device)
+        # add on extra dimension for batch size, use 1 and broadcast
+        self.fix_mask_ll = self.fix_mask_ll.unsqueeze(0)
+        # TODO: check loss_weight shape
         self.loss_weight_ll = torch.ones(1) if loss_weight_ll is None else torch.as_tensor(loss_weight_ll, device=self.device)
         self.x_max_ll = x_max_ll
         self.x_min_ll = x_min_ll

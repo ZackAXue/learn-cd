@@ -1,0 +1,59 @@
+seed: 0
+mode: train  # train or inference
+pipeline_name: jdm_blocks_world
+device: cuda:0
+discount: 0.99
+batch_size: 16
+epochs: 100
+log_interval: 100
+save_interval: 1000
+
+# Training Parameters
+lr_hl: 1e-4
+lr_ll: 1e-4
+weight_decay: 1e-6
+grad_clip_norm: 1.0
+diffusion_gradient_steps: 200000
+ema_rate: 0.999
+hl_weight: 1.0
+ll_weight: 1.0
+hl_action_loss_weight: 2.0
+ll_action_loss_weight: 2.0
+
+# Model Parameters
+model_dim: 128
+noise_schedule: cosine
+predict_noise: false
+diffusion_steps: 1000
+
+# Sampling Parameters
+solver: ddpm
+sampling_steps: 50
+use_ema: true
+temperature: 1.0
+w_cfg_hl: 0.0  # Classifier-free guidance weight for HL
+w_cfg_ll: 0.0  # Classifier-free guidance weight for LL
+preserve_history: true
+
+# Evaluation Parameters
+ckpt: null  # Checkpoint to load, null for final model
+eval_batch_size: 16
+eval_num_batches: 10
+num_samples_per_inference: 5
+hl_success_threshold: 0.1
+ll_success_threshold: 0.05
+save_samples: true
+num_vis_batches: 2
+
+task:
+  env_name: blocks_world
+  data_path: "dev/blocksworld/tamp_test_dataset.json"
+  val_data_path: data/blocks_world_val.json
+  tokenizer_save_path: "dev/blocksworld/blocks_tokenizer"
+  horizon: 8  # Number of high-level actions
+  steps_per_action: 6  # Number of motion steps per action
+  max_predicates: 11
+  max_blocks: 5
+  bit_dim: 6
+  dim_mult_hl: [1, 2, 4]
+  dim_mult_ll: [1, 2, 4]
