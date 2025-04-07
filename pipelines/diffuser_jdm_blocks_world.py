@@ -49,14 +49,16 @@ def pipeline(args):
 
     # ---------------------- Define Dimensions ----------------------
     # High-level dimensions
-    hl_obs_dim = (args.task.max_predicates * 2) * args.task.bit_dim  # init + goal predicates
-    hl_act_dim = args.task.horizon * args.task.bit_dim  # HL discrete actions (bits)
+    hl_obs_dim = (args.task.max_predicates * 2)  # init + goal predicates
+    hl_act_dim = args.task.horizon # HL discrete actions (bits)
     hl_overall_dim = hl_obs_dim + hl_act_dim  # Overall high-level dimension
+    hl_horizon = args.task.horizon + args.task.max_predicates * 2
 
     # Low-level dimensions
-    ll_obs_dim = (args.task.max_blocks * 2 + 2) * 3  # init + goal blocks (adding time dim) + ee coords
-    ll_act_dim = args.task.horizon * args.task.steps_per_action * 3  # LL motion trajectory (time, x, z)
+    ll_obs_dim = (args.task.max_blocks * 2 + 2)  # init + goal blocks (adding time dim) + ee coords
+    ll_act_dim = args.task.horizon * args.task.steps_per_action  # LL motion trajectory (time, x, z)
     ll_overall_dim = ll_obs_dim + ll_act_dim  # Overall low-level dimension
+    ll_horizon = args.task.max_blocks * 2 + 2 + args.task.horizon * args.task.steps_per_action
     # ---------------------- Network Architecture ----------------------
     # High-level diffusion network (for discrete symbolic actions)
     nn_diffusion_hl = JannerUNet1d(
@@ -93,24 +95,21 @@ def pipeline(args):
 
     # ---------------------- Create Masks for Fixed Components ----------------------
     # High-level: fix initial and goal predicates
-    fix_mask_hl = torch.zeros((hl_overall_dim), device=args.device)
+    fix_mask_hl = torch.zeros((hl_horizon, args.task.bit_dim), device=args.device)
     fix_mask_hl[:hl_obs_dim] = 1.0  # Fix all observation components (init + goal)
-    fix_mask_hl = fix_mask_hl.reshape(1, -1)  # Reshape for broadcasting
     
     # Low-level: fix initial and goal coordinates
-    fix_mask_ll = torch.zeros((ll_overall_dim), device=args.device)
+    fix_mask_ll = torch.zeros((ll_horizon, 3), device=args.device)
     fix_mask_ll[:ll_obs_dim + 2] = 1.0  # Fix all observation components (block coords + ee_init + ee_goal)
-    fix_mask_ll = fix_mask_ll.reshape(1, -1)  # Reshape for broadcasting
-    import pdb
+
     # ---------------------- Loss Weights ----------------------
     # Add higher weight to action components if needed
-    loss_weight_hl = torch.ones((hl_obs_dim + hl_act_dim), device=args.device)
+    loss_weight_hl = torch.ones((hl_horizon, args.task.bit_dim), device=args.device)
     loss_weight_hl[hl_obs_dim:] = args.hl_action_loss_weight
-    loss_weight_hl = loss_weight_hl.reshape(1, -1)  # Reshape for broadcasting
+
     
-    loss_weight_ll = torch.ones((ll_obs_dim + ll_act_dim), device=args.device)
+    loss_weight_ll = torch.ones((ll_horizon, 3), device=args.device)
     loss_weight_ll[ll_obs_dim:] = args.ll_action_loss_weight
-    loss_weight_ll = loss_weight_ll.reshape(1, -1)  # Reshape for broadcasting
 
     # ---------------------- Create JDM Diffusion Model ----------------------
     agent = JdmContinuousDiffusionSDE(
@@ -175,42 +174,37 @@ def pipeline(args):
                 
                 # -------------------- Prepare Inputs --------------------
                 batch_size = init_discrete.shape[0]
-                
-                # Prepare high-level input: concatenate init+goal predicates and actions
-                init_discrete_flat = init_discrete.reshape(batch_size, -1)  # (B, 11*6)
-                goal_discrete_flat = goal_discrete.reshape(batch_size, -1)  # (B, 11*6)
-                hl_actions_flat = hl_actions.reshape(batch_size, -1)  # (B, 8*6)
-                
-                x0_hl = torch.cat([init_discrete_flat, goal_discrete_flat, hl_actions_flat], dim=1)  # (B, (11+11+8)*6)
-                # add one dimention at dim=1 for sequence length
-                x0_hl = x0_hl.unsqueeze(1)  # (B, 1, (11+11+8)*6)
-                # Prepare low-level input: concatenate block coordinates, ee coords, and motion trajectory
-                # Add time dimension to block coordinates (zeros for simplicity)
+
+                # High-level: (B, 11, 6) + (B, 11, 6) + (B, 8, 6) ==> (B, 30, 6)
+                # CHANGED ↓↓↓ -- no flatten, no unsqueeze
+                x0_hl = torch.cat([init_discrete, goal_discrete, hl_actions], dim=1)  # shape: (B, 11+11+8=30, 6)
+
+                # Low-level: we want (B, 60, 3) total
+                #   each part is (B, #segments, 3), then cat along dim=1
                 time_dim = torch.zeros(batch_size, args.task.max_blocks, 1, device=args.device)
-                
-                init_coords_block_with_time = torch.cat([time_dim, init_coords_block], dim=2)  # (B, 5, 3)
-                goal_coords_block_with_time = torch.cat([time_dim, goal_coords_block], dim=2)  # (B, 5, 3)
-                
-                # Add time dimension to ee coordinates
-                init_coords_ee_with_time = torch.cat([torch.zeros(batch_size, 1, 1, device=args.device), 
-                                                      init_coords_ee], dim=2)  # (B, 1, 3)
-                goal_coords_ee_with_time = torch.cat([torch.zeros(batch_size, 1, 1, device=args.device), 
-                                                      goal_coords_ee], dim=2)  # (B, 1, 3)
-                
-                # Flatten and concatenate all low-level components
-                init_coords_block_flat = init_coords_block_with_time.reshape(batch_size, -1)  # (B, 5*3)
-                goal_coords_block_flat = goal_coords_block_with_time.reshape(batch_size, -1)  # (B, 5*3)
-                init_coords_ee_flat = init_coords_ee_with_time.reshape(batch_size, -1)  # (B, 1*3)
-                goal_coords_ee_flat = goal_coords_ee_with_time.reshape(batch_size, -1)  # (B, 1*3)
-                ll_traj_flat = ll_traj.reshape(batch_size, -1)  # (B, 48*3)
-                
+                # (B, 5, 2) -> add time => (B, 5, 3)
+                init_coords_block_with_time = torch.cat([time_dim, init_coords_block], dim=2)
+                goal_coords_block_with_time = torch.cat([time_dim, goal_coords_block], dim=2)
+
+                # (B, 1, 2) -> add time => (B, 1, 3)
+                init_coords_ee_with_time = torch.cat([
+                    torch.zeros(batch_size, 1, 1, device=args.device),
+                    init_coords_ee
+                ], dim=2)
+                goal_coords_ee_with_time = torch.cat([
+                    torch.zeros(batch_size, 1, 1, device=args.device),
+                    goal_coords_ee
+                ], dim=2)
+
+                # CHANGED ↓↓↓ -- no flatten, no unsqueeze
+                # Now simply cat along dim=1 to get (B, 60, 3)
                 x0_ll = torch.cat([
-                    init_coords_block_flat, goal_coords_block_flat,
-                    init_coords_ee_flat, goal_coords_ee_flat,
-                    ll_traj_flat
-                ], dim=1)  # (B, (5+5+1+1)*3 + 48*3)
-                # add one dimention at dim=1 for sequence length
-                x0_ll = x0_ll.unsqueeze(1)  # (B, 1, (5+5+1+1)*3 + 48*3)
+                    init_coords_block_with_time,    # (B, 5, 3)
+                    goal_coords_block_with_time,    # (B, 5, 3)
+                    init_coords_ee_with_time,       # (B, 1, 3)
+                    goal_coords_ee_with_time,       # (B, 1, 3)
+                    ll_traj                         # (B, 48, 3)
+                ], dim=1)  # => shape (B, 60, 3)
                 # -------------------- Update Model --------------------
                 # Compute weights for this batch (can adjust based on training progress)
                 hl_weight = args.hl_weight
