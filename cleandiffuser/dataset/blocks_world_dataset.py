@@ -190,15 +190,18 @@ class BlocksWorldDataset(BaseDataset):
         init_coords_ee = np.array(ep["state_sequence"][0].get("ee_pos"), dtype=np.float32)
         goal_coords_ee = np.array(ep["state_sequence"][-1].get("ee_pos"), dtype=np.float32)
 
+        hl_overall_horizon = init_discrete.shape[0] + goal_discrete.shape[0] + self.horizon
+        ll_overall_horizon = self.horizon * self.steps_per_action + init_coords_block.shape[0] + goal_coords_block.shape[0] + 2
         # HL 动作 (8, bit_dim)
         action_names = [a["action_name"] for a in ep.get("action_sequence",[])]
-        hl_actions = self.parse_action_sequence(action_names, self.horizon, self.bit_dim)
+        hl_actions = self.parse_action_sequence(action_names, self.horizon, self.bit_dim, hl_overall_horizon=hl_overall_horizon)
 
         # LL 轨迹 (horizon*steps_per_action, 3)
         # segment_idx: e.g. [(0,5),(5,10),...]
         ll_traj, seg_idx = self.parse_ll_motion(ep.get("motion_data", []),
                                                 self.horizon,
-                                                self.steps_per_action)
+                                                self.steps_per_action,
+                                                ll_overall_horizon=ll_overall_horizon)
 
         # obs
         obs_dict = {
@@ -264,7 +267,7 @@ class BlocksWorldDataset(BaseDataset):
                     break
         return arr
 
-    def parse_action_sequence(self, action_list:List[str], horizon:int, bit_dim:int):
+    def parse_action_sequence(self, action_list:List[str], horizon:int, bit_dim:int, hl_overall_horizon:int=None):
         """
         HL动作列表 -> shape (horizon, bit_dim)
         """
@@ -280,9 +283,15 @@ class BlocksWorldDataset(BaseDataset):
         # padding
         for i in range(n, horizon):
             arr[i,:] = self.pad_bits
+        # if hl_overall_horizon != 2^n, add padding at the end until 2^n due to the design of jannernet
+        if hl_overall_horizon is not None:
+            next_power_of_2 = 1 if hl_overall_horizon == 0 else 2**(hl_overall_horizon - 1).bit_length()
+            padding_num =  next_power_of_2 - hl_overall_horizon
+            if padding_num > 0:
+                arr = np.concatenate((arr, np.tile(self.pad_bits, (padding_num, 1))), axis=0)
         return arr
 
-    def parse_ll_motion(self, motion_data, horizon:int, steps_per_action:int):
+    def parse_ll_motion(self, motion_data, horizon:int, steps_per_action:int, ll_overall_horizon:int=None):
         """
         生成 (horizon*steps_per_action,3) + segment_idx
         motion_data: list of shape -> motion_data[i]["time_series"] ~ (<=5 steps), each [t, x, z]
@@ -309,6 +318,28 @@ class BlocksWorldDataset(BaseDataset):
             steps = min(len(series), steps_per_action)
             for s_idx in range(steps):
                 arr[start+s_idx,:] = series[s_idx]
+
+        if ll_overall_horizon is not None:
+            next_power_of_2 = 1 if ll_overall_horizon == 0 else 2**(ll_overall_horizon - 1).bit_length()
+            padding_num = next_power_of_2 - ll_overall_horizon
+            
+            if padding_num > 0:
+                # Get the last non-zero motion element as the padding value
+                # (or use zeros if all elements are zero)
+                last_idx = total_len - 1
+                    
+                padding_value = arr[last_idx]
+                
+                # Create padding array with the last motion data element repeated
+                padding_array = np.tile(padding_value, (padding_num, 1))
+                
+                # Concatenate with original array
+                arr = np.concatenate((arr, padding_array), axis=0)
+                
+                # Adjust segment indices for the last segment to include padding
+                if horizon > 0:
+                    seg_idx[-1, 1] = seg_idx[-1, 1] + padding_num
+                
         return arr, seg_idx
 
     def __getitem__(self, idx: int):

@@ -50,10 +50,11 @@ task:
   data_path: "dev/blocksworld/tamp_test_dataset.json"
   val_data_path: data/blocks_world_val.json
   tokenizer_save_path: "dev/blocksworld/blocks_tokenizer"
-  horizon: 10  # Number of high-level actions
+  horizon: 8  # Number of high-level actions
   steps_per_action: 6  # Number of motion steps per action
   max_predicates: 11
   max_blocks: 5
   bit_dim: 6
+  motion_dim: 3
   dim_mult_hl: [1, 2, 4]
   dim_mult_ll: [1, 2, 4]

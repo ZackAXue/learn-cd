@@ -12,6 +12,8 @@ from cleandiffuser.utils import report_parameters, set_seed
 from cleandiffuser.dataset.blocks_world_dataset import BlocksWorldDataset
 
 from cleandiffuser.diffusion import JdmContinuousDiffusionSDE
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"  # or "true" if you want to enable it
 # ---------------------- Define Dimensions ----------------------
 # High-level input dimensions: (11 + 11 + 8 )*6
 # High-level mask: (11 + 11 )*6 [part of HL input]
@@ -53,33 +55,40 @@ def pipeline(args):
     hl_act_dim = args.task.horizon # HL discrete actions (bits)
     hl_overall_dim = hl_obs_dim + hl_act_dim  # Overall high-level dimension
     hl_horizon = args.task.horizon + args.task.max_predicates * 2
+    next_power_of_2 = 2**(hl_horizon - 1).bit_length()
+    # For jannner unet, we need to pad the input to the next power of 2
+    hl_horizon = next_power_of_2
 
     # Low-level dimensions
     ll_obs_dim = (args.task.max_blocks * 2 + 2)  # init + goal blocks (adding time dim) + ee coords
     ll_act_dim = args.task.horizon * args.task.steps_per_action  # LL motion trajectory (time, x, z)
     ll_overall_dim = ll_obs_dim + ll_act_dim  # Overall low-level dimension
     ll_horizon = args.task.max_blocks * 2 + 2 + args.task.horizon * args.task.steps_per_action
+    next_power_of_2 = 2**(ll_horizon - 1).bit_length()
+    # For jannner unet, we need to pad the input to the next power of 2
+    ll_horizon = next_power_of_2
     # ---------------------- Network Architecture ----------------------
     # High-level diffusion network (for discrete symbolic actions)
     nn_diffusion_hl = JannerUNet1d(
-        hl_overall_dim, model_dim=args.model_dim, emb_dim=args.model_dim, 
+        args.task.bit_dim, model_dim=args.model_dim, emb_dim=args.model_dim, 
         dim_mult=args.task.dim_mult_hl,
         timestep_emb_type="positional", attention=True, kernel_size=5
     )
     
     # Low-level diffusion network (for continuous motion)
     nn_diffusion_ll = JannerUNet1d(
-        ll_overall_dim, model_dim=args.model_dim, emb_dim=args.model_dim, 
+        args.task.motion_dim, model_dim=args.model_dim, emb_dim=args.model_dim, 
         dim_mult=args.task.dim_mult_ll,
         timestep_emb_type="positional", attention=True, kernel_size=5
     )
+
     # Cross-attention condition networks
     nn_condition_hl_to_ll = PearceObsCondition(
-        obs_dim=hl_overall_dim, emb_dim=args.model_dim, flatten=True, dropout=0.1
+        obs_dim=args.task.bit_dim, emb_dim=args.model_dim, flatten=True, dropout=0.1
     )
     
     nn_condition_ll_to_hl = PearceObsCondition(
-        obs_dim=ll_overall_dim, emb_dim=args.model_dim, flatten=True, dropout=0.1
+        obs_dim=args.task.motion_dim, emb_dim=args.model_dim, flatten=True, dropout=0.1
     )
     # TODO: make the encoder larger for the condition networks
     # Print model parameter summaries
@@ -99,17 +108,17 @@ def pipeline(args):
     fix_mask_hl[:hl_obs_dim] = 1.0  # Fix all observation components (init + goal)
     
     # Low-level: fix initial and goal coordinates
-    fix_mask_ll = torch.zeros((ll_horizon, 3), device=args.device)
+    fix_mask_ll = torch.zeros((ll_horizon, args.task.motion_dim), device=args.device)
     fix_mask_ll[:ll_obs_dim + 2] = 1.0  # Fix all observation components (block coords + ee_init + ee_goal)
 
     # ---------------------- Loss Weights ----------------------
     # Add higher weight to action components if needed
     loss_weight_hl = torch.ones((hl_horizon, args.task.bit_dim), device=args.device)
-    loss_weight_hl[hl_obs_dim:] = args.hl_action_loss_weight
+    # loss_weight_hl[hl_obs_dim:] = args.hl_action_loss_weight
 
     
-    loss_weight_ll = torch.ones((ll_horizon, 3), device=args.device)
-    loss_weight_ll[ll_obs_dim:] = args.ll_action_loss_weight
+    loss_weight_ll = torch.ones((ll_horizon, args.task.motion_dim), device=args.device)
+    # loss_weight_ll[ll_obs_dim:] = args.ll_action_loss_weight
 
     # ---------------------- Create JDM Diffusion Model ----------------------
     agent = JdmContinuousDiffusionSDE(
@@ -203,7 +212,7 @@ def pipeline(args):
                     goal_coords_block_with_time,    # (B, 5, 3)
                     init_coords_ee_with_time,       # (B, 1, 3)
                     goal_coords_ee_with_time,       # (B, 1, 3)
-                    ll_traj                         # (B, 48, 3)
+                    ll_traj                         # (B, 50, 3)
                 ], dim=1)  # => shape (B, 60, 3)
                 # -------------------- Update Model --------------------
                 # Compute weights for this batch (can adjust based on training progress)
