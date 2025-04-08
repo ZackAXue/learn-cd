@@ -2,15 +2,15 @@ project: blocks_world
 group: jdm
 name: jdm_blocks_world
 seed: 0
-mode: inference  # train or inference
-enable_wandb : false
+mode: train  # train or inference
+enable_wandb : true
 pipeline_name: jdm_blocks_world
 device: cuda:0
 discount: 0.99
 batch_size: 16
-epochs: 10
+epochs: 50
 log_interval: 100
-save_interval: 1000
+save_interval: 20000
 
 # Training Parameters
 lr_hl: 1e-4

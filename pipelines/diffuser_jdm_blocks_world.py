@@ -326,7 +326,7 @@ def pipeline(args):
             # Process high-level components
             init_discrete = batch["obs"]["init_discrete"].to(args.device)  # (B, 11, 6)
             goal_discrete = batch["obs"]["goal_discrete"].to(args.device)  # (B, 11, 6)
-            hl_actions = batch["hl_discrete_action_seq"].to(args.device)  # (B, 8, 6)
+            gt_hl_actions = batch["hl_discrete_action_seq"].to(args.device)  # (B, 8, 6)
             
             # Process low-level components
             init_coords_block = batch["obs"]["init_coords_block"].to(args.device)  # (B, 5, 2)
@@ -334,7 +334,7 @@ def pipeline(args):
             init_coords_ee = batch["obs"]["init_coords_ee"].to(args.device).unsqueeze(1)  # (B, 1, 2)
             # we use time = 0 for the goal ee coords
             goal_coords_ee = batch["obs"]["goal_coords_ee"].to(args.device).unsqueeze(1)  # (B, 1, 2)
-            ll_traj = batch["ll_traj"].to(args.device)  # (B, 48, 3)
+            gt_ll_traj = batch["ll_traj"].to(args.device)  # (B, 48, 3)
             
             # Process segment indices (might be needed for future conditioning)
             segment_idx = batch["segment_idx"].to(args.device)  # (B, 8, 2)
@@ -409,12 +409,18 @@ def pipeline(args):
                 
                 # Extract the action part from the HL samples
                 hl_action_start = hl_obs_dim
-                sampled_hl_actions = best_samples_hl[:, hl_action_start:].reshape(batch_size, hl_horizon, args.task.bit_dim)
+                # TODO: revise the horizon in reshape to more general
+                sampled_hl_actions = best_samples_hl[:, hl_action_start:].reshape(batch_size, 10, args.task.bit_dim)
                 
                 # Extract the trajectory part from the LL samples
                 ll_act_start = ll_obs_dim
-                sampled_ll_traj = best_samples_ll[:, ll_act_start:].reshape(batch_size, ll_horizon, args.task.motion_dim)
+                # TODO: revise the horizon in reshape to more general
+                sampled_ll_traj = best_samples_ll[:, ll_act_start:].reshape(batch_size, 52, args.task.motion_dim)
                 
+                # slice sampled_hl_actions and sampled_ll_traj to the original size
+                sampled_hl_actions = sampled_hl_actions[:, :hl_horizon, :]
+                sampled_ll_traj = sampled_ll_traj[:, :ll_horizon, :]
+
                 # Evaluate success (for demonstration, using a simple criterion)
                 # In a real implementation, you'd evaluate against task-specific success metrics
                 hl_errors = torch.mean((sampled_hl_actions - gt_hl_actions) ** 2, dim=(1, 2))
@@ -449,8 +455,8 @@ def pipeline(args):
             if args.enable_wandb:
                 wandb.log({"overall_success_rate": success_rate / total_samples})
 
-    if args.enable_wandb:
-            wandb.finish()
+        if args.enable_wandb:
+                wandb.finish()
     else:
         raise ValueError(f"Invalid mode: {args.mode}")
 
