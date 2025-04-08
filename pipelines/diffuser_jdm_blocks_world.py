@@ -100,11 +100,11 @@ def pipeline(args):
     # Cross-attention condition networks
     # x_ll | x_hl_emb
     nn_condition_hl_to_ll = PearceObsConditionV2(
-        obs_dim=args.task.bit_dim, emb_dim=args.model_dim, out_horizon=1, flatten=True, dropout=0.1
+        obs_dim=args.task.bit_dim, emb_dim=args.model_dim, in_horizon=32 ,out_horizon=1, flatten=True, dropout=0.1
     )
     # x_hl | x_ll_emb
     nn_condition_ll_to_hl = PearceObsConditionV2(
-        obs_dim=args.task.motion_dim, emb_dim=args.model_dim, out_horizon=1, flatten=True, dropout=0.1
+        obs_dim=args.task.motion_dim, emb_dim=args.model_dim, in_horizon=64, out_horizon=1, flatten=True, dropout=0.1
     )
     # TODO: make the encoder larger for the condition networks
     # Print model parameter summaries
@@ -158,6 +158,7 @@ def pipeline(args):
         ema_rate=args.ema_rate,
         optim_params_hl={"lr": args.lr_hl, "weight_decay": args.weight_decay},
         optim_params_ll={"lr": args.lr_ll, "weight_decay": args.weight_decay},
+        expected_sample_steps=args.expected_sample_steps,
         
         # Diffusion parameters
         epsilon=1e-3,
@@ -408,11 +409,11 @@ def pipeline(args):
                 
                 # Extract the action part from the HL samples
                 hl_action_start = hl_obs_dim
-                sampled_hl_actions = best_samples_hl[:, hl_action_start:].reshape(batch_size, args.task.horizon, args.task.bit_dim)
+                sampled_hl_actions = best_samples_hl[:, hl_action_start:].reshape(batch_size, hl_horizon, args.task.bit_dim)
                 
                 # Extract the trajectory part from the LL samples
                 ll_act_start = ll_obs_dim
-                sampled_ll_traj = best_samples_ll[:, ll_act_start:].reshape(batch_size, args.task.horizon * args.task.steps_per_action, 3)
+                sampled_ll_traj = best_samples_ll[:, ll_act_start:].reshape(batch_size, ll_horizon, args.task.motion_dim)
                 
                 # Evaluate success (for demonstration, using a simple criterion)
                 # In a real implementation, you'd evaluate against task-specific success metrics
