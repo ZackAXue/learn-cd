@@ -542,3 +542,27 @@ def int2bits(x, n, out_dtype=None):
 def bits2range(x):
     # convert the 0 in x to -1
     return 2 * x - 1
+
+def pad_to_next_power_of_2(tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Pads a (B, T, D) tensor along dimension 1 (the 'time' dimension)
+    so that T becomes the next power of 2, by repeating the last timestep.
+    """
+    B, T, D = tensor.shape
+
+    # Compute next power of 2 for T
+    next_pow2 = 2 ** ((T - 1).bit_length())
+    
+    # If T is already a power of 2, no padding needed
+    if T == next_pow2:
+        return tensor
+    
+    # Otherwise, repeat the last timestep
+    pad_length = next_pow2 - T  # how many extra steps
+    # shape (B, 1, D) – the last row
+    last_row = tensor[:, -1:, :]  
+    # shape (B, pad_length, D) – repeat last row pad_length times
+    pad_data = last_row.expand(B, pad_length, D)
+    
+    # Concatenate along time dimension
+    return torch.cat([tensor, pad_data], dim=1)

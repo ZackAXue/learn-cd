@@ -5,13 +5,15 @@ import numpy as np
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 
+import wandb, uuid
 from cleandiffuser.dataset.dataset_utils import loop_dataloader
 from cleandiffuser.nn_diffusion import JannerUNet1d
-from cleandiffuser.nn_condition import PearceObsCondition
-from cleandiffuser.utils import report_parameters, set_seed
+from cleandiffuser.nn_condition import PearceObsCondition, PearceObsConditionV2
+from cleandiffuser.utils import report_parameters, set_seed, pad_to_next_power_of_2
 from cleandiffuser.dataset.blocks_world_dataset import BlocksWorldDataset
 
 from cleandiffuser.diffusion import JdmContinuousDiffusionSDE
+from omegaconf import OmegaConf
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"  # or "true" if you want to enable it
 # ---------------------- Define Dimensions ----------------------
@@ -25,8 +27,21 @@ def pipeline(args):
     """
     Main pipeline for training and evaluating the JDM diffuser on the Blocks World task.
     """
-    set_seed(args.seed)
+    args.device = args.device if torch.cuda.is_available() else "cpu"
+    if args.enable_wandb and args.mode in ["inference", "train"]:
+        wandb.require("core")
+        print(args)
+        wandb.init(
+            reinit=True,
+            id=str(uuid.uuid4()),
+            project=str(args.project),
+            group=str(args.group),
+            name=str(args.name),
+            config=OmegaConf.to_container(args, resolve=True)
+        )
 
+    set_seed(args.seed)
+    
     save_path = f'results/{args.pipeline_name}/{args.task.env_name}/'
     if not os.path.exists(save_path):
         os.makedirs(save_path)
@@ -83,12 +98,13 @@ def pipeline(args):
     )
 
     # Cross-attention condition networks
-    nn_condition_hl_to_ll = PearceObsCondition(
-        obs_dim=args.task.bit_dim, emb_dim=args.model_dim, flatten=True, dropout=0.1
+    # x_ll | x_hl_emb
+    nn_condition_hl_to_ll = PearceObsConditionV2(
+        obs_dim=args.task.bit_dim, emb_dim=args.model_dim, out_horizon=1, flatten=True, dropout=0.1
     )
-    
-    nn_condition_ll_to_hl = PearceObsCondition(
-        obs_dim=args.task.motion_dim, emb_dim=args.model_dim, flatten=True, dropout=0.1
+    # x_hl | x_ll_emb
+    nn_condition_ll_to_hl = PearceObsConditionV2(
+        obs_dim=args.task.motion_dim, emb_dim=args.model_dim, out_horizon=1, flatten=True, dropout=0.1
     )
     # TODO: make the encoder larger for the condition networks
     # Print model parameter summaries
@@ -161,6 +177,7 @@ def pipeline(args):
         n_gradient_step = 0
         log = {"avg_loss_hl": 0., "avg_loss_ll": 0., "avg_loss_combined": 0.}
 
+
         for epoch in range(args.epochs):
             print(f"Epoch {epoch+1}/{args.epochs}")
             
@@ -200,6 +217,7 @@ def pipeline(args):
                     torch.zeros(batch_size, 1, 1, device=args.device),
                     init_coords_ee
                 ], dim=2)
+                # we use time = 0 for the goal ee coords
                 goal_coords_ee_with_time = torch.cat([
                     torch.zeros(batch_size, 1, 1, device=args.device),
                     goal_coords_ee
@@ -250,6 +268,8 @@ def pipeline(args):
                     log["avg_loss_ll"] /= args.log_interval
                     log["avg_loss_combined"] /= args.log_interval
                     print(f"Step {n_gradient_step}: {log}")
+                    if args.enable_wandb:
+                        wandb.log(log, step=n_gradient_step + 1)
                     log = {"avg_loss_hl": 0., "avg_loss_ll": 0., "avg_loss_combined": 0.}
                 
                 # Save periodically
@@ -271,7 +291,7 @@ def pipeline(args):
     # ---------------------- Inference ----------------------
     elif args.mode == "inference":
         # Load the trained model
-        agent.load(save_path + f"jdm_diffusion_ckpt_{args.ckpt}.pt" if args.ckpt else save_path + "jdm_diffusion_final.pt")
+        agent.load(save_path + f"jdm_diffusion_step{args.ckpt}.pt" if args.ckpt else save_path + "jdm_diffusion_final.pt")
         agent.eval()
         
         # Sample from the validation set
@@ -294,59 +314,69 @@ def pipeline(args):
         # Run inference on samples
         success_rate = 0.0
         total_samples = 0
+        batch_size=args.eval_batch_size
         
         for batch_idx, batch in enumerate(val_dataloader):
             if batch_idx >= args.eval_num_batches:
                 break
                 
             # Process batch similar to training
+            # -------------------- Process Batch --------------------
+            # Process high-level components
             init_discrete = batch["obs"]["init_discrete"].to(args.device)  # (B, 11, 6)
             goal_discrete = batch["obs"]["goal_discrete"].to(args.device)  # (B, 11, 6)
+            hl_actions = batch["hl_discrete_action_seq"].to(args.device)  # (B, 8, 6)
             
+            # Process low-level components
             init_coords_block = batch["obs"]["init_coords_block"].to(args.device)  # (B, 5, 2)
             goal_coords_block = batch["obs"]["goal_coords_block"].to(args.device)  # (B, 5, 2)
-            init_coords_ee = batch["obs"]["init_coords_ee"].to(args.device)  # (B, 1, 2)
-            goal_coords_ee = batch["obs"]["goal_coords_ee"].to(args.device)  # (B, 1, 2)
+            init_coords_ee = batch["obs"]["init_coords_ee"].to(args.device).unsqueeze(1)  # (B, 1, 2)
+            # we use time = 0 for the goal ee coords
+            goal_coords_ee = batch["obs"]["goal_coords_ee"].to(args.device).unsqueeze(1)  # (B, 1, 2)
+            ll_traj = batch["ll_traj"].to(args.device)  # (B, 48, 3)
             
-            # Ground truth for evaluation
-            gt_hl_actions = batch["hl_discrete_action_seq"].to(args.device)  # (B, 8, 6)
-            gt_ll_traj = batch["ll_traj"].to(args.device)  # (B, 48, 3)
+            # Process segment indices (might be needed for future conditioning)
+            segment_idx = batch["segment_idx"].to(args.device)  # (B, 8, 2)
             
-            batch_size = init_discrete.shape[0]
-            
-            # Prepare priors (the known parts to condition on)
-            # HL prior: init and goal predicates, zeros for actions
-            init_discrete_flat = init_discrete.reshape(batch_size, -1)  # (B, 11*6)
-            goal_discrete_flat = goal_discrete.reshape(batch_size, -1)  # (B, 11*6)
-            hl_zeros = torch.zeros(batch_size, args.task.horizon * args.task.bit_dim, device=args.device)
-            
-            prior_hl = torch.cat([init_discrete_flat, goal_discrete_flat, hl_zeros], dim=1)
-            
-            # LL prior: block and ee coordinates, zeros for trajectory
-            time_dim = torch.zeros(batch_size, args.task.max_blocks, 1, device=args.device)
-            
-            init_coords_block_with_time = torch.cat([time_dim, init_coords_block], dim=2)  # (B, 5, 3)
-            goal_coords_block_with_time = torch.cat([time_dim, goal_coords_block], dim=2)  # (B, 5, 3)
-            
-            init_coords_ee_with_time = torch.cat([torch.zeros(batch_size, 1, 1, device=args.device), 
-                                                 init_coords_ee], dim=2)  # (B, 1, 3)
-            goal_coords_ee_with_time = torch.cat([torch.zeros(batch_size, 1, 1, device=args.device), 
-                                                 goal_coords_ee], dim=2)  # (B, 1, 3)
-            
-            init_coords_block_flat = init_coords_block_with_time.reshape(batch_size, -1)  # (B, 5*3)
-            goal_coords_block_flat = goal_coords_block_with_time.reshape(batch_size, -1)  # (B, 5*3)
-            init_coords_ee_flat = init_coords_ee_with_time.reshape(batch_size, -1)  # (B, 1*3)
-            goal_coords_ee_flat = goal_coords_ee_with_time.reshape(batch_size, -1)  # (B, 1*3)
-            
-            ll_zeros = torch.zeros(batch_size, args.task.horizon * args.task.steps_per_action * 3, device=args.device)
-            
+            # -------------------- Prepare Inputs --------------------
+            # Prepare HL prior: (B, 33, 6)
+            #  - We only know init (B,11,6) + goal (B,11,6), so we fill zeros for (B,8,6).
+            hl_zeros = torch.zeros(batch_size, args.task.horizon, args.task.bit_dim, device=args.device)
+            prior_hl = torch.cat([init_discrete, goal_discrete, hl_zeros], dim=1)  # => (B, 30, 6)
+            #  - For jannner unet, we need to pad the input to the next power of 2
+            prior_hl = pad_to_next_power_of_2(prior_hl)  # Pad to next power of 2
+            # copy the last element for dim 1 of prior_hl to the next 2^n
+            # Prepare LL prior: (B, 64, 3)
+            #  - We only know init+goal blocks (B,5,2), ee init+goal (B,1,2), so we fill zeros for (B,48,3) trajectory.
+
+            time_dim = torch.zeros(batch_size, args.task.max_blocks, 1, device=args.device)  # => (B,5,1)
+            init_coords_block_with_time = torch.cat([time_dim, init_coords_block], dim=2)  # => (B,5,3)
+            goal_coords_block_with_time = torch.cat([time_dim, goal_coords_block], dim=2)  # => (B,5,3)
+
+            init_coords_ee_with_time = torch.cat([
+                torch.zeros(batch_size, 1, 1, device=args.device), 
+                init_coords_ee
+            ], dim=2)  # => (B,1,3)
+            goal_coords_ee_with_time = torch.cat([
+                torch.zeros(batch_size, 1, 1, device=args.device), 
+                goal_coords_ee
+            ], dim=2)  # => (B,1,3)
+
+            ll_zeros = torch.zeros(batch_size, 48, 3, device=args.device)  # (B,48,3)
             prior_ll = torch.cat([
-                init_coords_block_flat, goal_coords_block_flat,
-                init_coords_ee_flat, goal_coords_ee_flat,
-                ll_zeros
-            ], dim=1)
+                init_coords_block_with_time,  # (B,5,3)
+                goal_coords_block_with_time,  # (B,5,3)
+                init_coords_ee_with_time,     # (B,1,3)
+                goal_coords_ee_with_time,     # (B,1,3)
+                ll_zeros                      # (B,48,3)
+            ], dim=1)  # => (B,60,3)
+            #  - For jannner unet, we need to pad the input to the next power of 2
+            prior_ll = pad_to_next_power_of_2(prior_ll)
+            # copy the last element for dim 1 of prior_ll to the next 2^n
+            #  - We need to pad the input to the next power of 2
+            #  - For jannner unet, we need to pad the input to the next power of 2
             
-            # Sample from the model
+            # -------------------- Sample from the model --------------------
             with torch.no_grad():
                 # For each batch, generate multiple samples and pick the best one
                 all_samples_hl = []
@@ -415,7 +445,11 @@ def pipeline(args):
         # Print overall results
         if total_samples > 0:
             print(f"Overall Success Rate: {success_rate / total_samples:.4f}")
-    
+            if args.enable_wandb:
+                wandb.log({"overall_success_rate": success_rate / total_samples})
+
+    if args.enable_wandb:
+            wandb.finish()
     else:
         raise ValueError(f"Invalid mode: {args.mode}")
 

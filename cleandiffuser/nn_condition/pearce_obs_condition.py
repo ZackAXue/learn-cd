@@ -48,3 +48,81 @@ class PearceObsCondition(IdentityCondition):
         embs = self.mlp(obs)  # (b, To, emb_dim)
         embs = torch.flatten(embs, 1) if self.flatten else embs
         return embs * mask
+
+
+class PearceObsConditionV2(IdentityCondition):
+    """
+    Modified observation condition from DiffusionBC: https://arxiv.org/abs/2301.10677
+    This version allows for different input and output time horizons.
+    
+    Args:
+        obs_dim: int, The dimension of the observation. Observation shape (b, horizon1, obs_dim)
+        emb_dim: int, The dimension of the condition embedding. Default: 128
+        out_horizon: int, The desired output time horizon (horizon2). Default: None (same as input)
+        flatten: bool, Whether to flatten the condition embedding. Default: False
+        dropout: float, The label dropout rate. Default: 0.25
+    
+    Examples:
+        >>> nn_condition = PearceObsCondition(obs_dim=3, emb_dim=128, out_horizon=15)
+        >>> obs = torch.randn(2, 10, 3)  # [B, horizon1, D]
+        >>> nn_condition(obs).shape
+        torch.Size([2, 15, 128])  # [B, horizon2, emb_dim]
+        >>> nn_condition = PearceObsCondition(obs_dim=3, emb_dim=128, out_horizon=15, flatten=True)
+        >>> obs = torch.randn(2, 10, 3)  # [B, horizon1, D]
+        >>> nn_condition(obs).shape
+        torch.Size([2, 1920])  # [B, horizon2*emb_dim]
+    """
+    def __init__(self, obs_dim: int, emb_dim: int = 128, out_horizon: Optional[int] = None,
+                 flatten: bool = False, dropout: float = 0.25):
+        super().__init__(dropout)
+        self.mlp = nn.Sequential(
+            nn.Linear(obs_dim, emb_dim),
+            nn.LeakyReLU(),
+            nn.Linear(emb_dim, emb_dim)
+        )
+        self.flatten = flatten
+        self.out_horizon = out_horizon
+        
+        # Temporal transformation layer - only created if out_horizon is specified
+        if out_horizon is not None:
+            self.temporal_transform = nn.Linear(1, 1)  # Placeholder, will be reshaped during forward pass
+        
+    def forward(self, obs: torch.Tensor, mask: Optional[torch.Tensor] = None):
+        batch_size, in_horizon, _ = obs.shape
+        
+        # Process using MLP as before
+        embs = self.mlp(obs)  # (b, horizon1, emb_dim)
+        
+        # Handle the temporal dimension transformation if out_horizon is specified
+        # Apply temporal transformation regardless of flatten setting
+        if self.out_horizon is not None:
+            embs = embs.transpose(1, 2)  # (b, emb_dim, horizon1)
+            
+            # Create or update temporal transformation if needed
+            if not hasattr(self, 'temporal_transform') or self.temporal_transform.weight.shape != (self.out_horizon, in_horizon):
+                self.temporal_transform = nn.Linear(in_horizon, self.out_horizon).to(embs.device)
+                
+            embs = self.temporal_transform(embs)  # (b, emb_dim, horizon2)
+            embs = embs.transpose(1, 2)  # (b, horizon2, emb_dim)
+            
+            # Create appropriate mask for the new temporal dimension
+            if mask is not None:
+                mask = at_least_ndim(get_mask(
+                    mask, (batch_size,), self.dropout, self.training, obs.device), 3)
+                # Adjust mask to match the new temporal dimension
+                if mask.shape[1] != self.out_horizon:
+                    new_mask = torch.ones((batch_size, self.out_horizon, 1), 
+                                          device=mask.device, dtype=mask.dtype)
+                    mask = new_mask * mask[:, 0:1, :]  # Broadcast the first mask value
+        
+        # Handle flattening if requested (after temporal transformation)
+        if self.flatten:
+            # Now flattening will give us (b, out_horizon*emb_dim)
+            embs = torch.flatten(embs, 1)
+            mask = at_least_ndim(get_mask(
+                mask, (batch_size,), self.dropout, self.training, obs.device), 2)
+        else:
+            mask = at_least_ndim(get_mask(
+                mask, (batch_size,), self.dropout, self.training, obs.device), 3)
+        
+        return embs * mask

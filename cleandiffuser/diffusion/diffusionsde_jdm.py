@@ -335,6 +335,7 @@ class JdmContinuousDiffusionSDE(BaseDiffusionSDE):
             ema_rate: float = 0.995,
             optim_params_hl: Optional[dict] = None,
             optim_params_ll: Optional[dict] = None,
+            expected_sample_steps = 50,
             
             # ------------------- Diffusion Params ------------------- #
             epsilon: float = 1e-3,
@@ -353,7 +354,7 @@ class JdmContinuousDiffusionSDE(BaseDiffusionSDE):
         # Initialize the base class with HL diffusion parameters
         # We'll initialize only one of the diffusion models with the base class
         super().__init__(
-            nn_diffusion_hl, nn_condition_ll_to_hl, fix_mask_hl, loss_weight_hl, 
+            nn_diffusion_hl, nn_condition_hl_to_ll, fix_mask_hl, loss_weight_hl, 
             classifier_hl, grad_clip_norm, ema_rate, optim_params_hl,
             epsilon, noise_schedule, noise_schedule_params, x_max_hl, x_min_hl, 
             predict_noise, device
@@ -361,15 +362,16 @@ class JdmContinuousDiffusionSDE(BaseDiffusionSDE):
         
         # Store hierarchical parameters
         self.steps_per_action = steps_per_action
+        self.expected_sample_steps = expected_sample_steps
         
         # ==================== Create a second diffusion model for LL ====================
         # Store LL neural networks
         self.nn_diffusion_ll = nn_diffusion_ll
-        self.nn_condition_hl_to_ll = nn_condition_hl_to_ll
+        self.nn_condition_ll_to_hl = nn_condition_ll_to_hl
         
         # Create LL model and optimizer
-        self.model_ll = {"diffusion": self.nn_diffusion_ll, "condition": self.nn_condition_hl_to_ll}
-        self.model_ll_ema = {"diffusion": deepcopy(self.nn_diffusion_ll), "condition": deepcopy(self.nn_condition_hl_to_ll) if self.nn_condition_hl_to_ll is not None else None}
+        self.model_ll = {"diffusion": self.nn_diffusion_ll, "condition": self.nn_condition_ll_to_hl}
+        self.model_ll_ema = {"diffusion": deepcopy(self.nn_diffusion_ll), "condition": deepcopy(self.nn_condition_ll_to_hl) if self.nn_condition_ll_to_hl is not None else None}
         
         # Move LL models to device
         for k, v in self.model_ll.items():
@@ -435,7 +437,7 @@ class JdmContinuousDiffusionSDE(BaseDiffusionSDE):
     def add_noise(self, x0_hl, x0_ll, t_hl=None, t_ll=None, eps_hl=None, eps_ll=None):
         """
         Add noise to both high-level (HL) discrete actions and low-level (LL) motion data.
-        
+        Also generates a previous time step version of HL data for conditioning.
         Args:
             x0_hl: torch.Tensor
                 Clean high-level discrete actions, shape (batch_size, horizon, bit_dim)
@@ -455,6 +457,8 @@ class JdmContinuousDiffusionSDE(BaseDiffusionSDE):
                 Noisy high-level discrete actions
             t_hl: torch.Tensor
                 Time steps used for HL diffusion
+            xt_hl_prev: torch.Tensor
+                Noisy high-level discrete actions at time t-1 (for conditioning LL)
             eps_hl: torch.Tensor
                 Noise used for HL diffusion
             xt_ll: torch.Tensor
@@ -470,6 +474,13 @@ class JdmContinuousDiffusionSDE(BaseDiffusionSDE):
         if t_hl is None:
             t_hl = torch.rand((batch_size,), device=self.device) * \
                 (self.t_diffusion[1] - self.t_diffusion[0]) + self.t_diffusion[0]
+        
+        # Create a previous time step for HL (for conditioning)
+        time_range = self.t_diffusion[1] - self.t_diffusion[0]
+        # 默认值可以在__init__中设置: self.expected_sample_steps = 20
+        delta_factor = 1.0 / self.expected_sample_steps
+        time_delta = time_range * delta_factor
+        t_hl_prev = torch.max(t_hl - time_delta, torch.ones_like(t_hl) * self.t_diffusion[0])
         
         if t_ll is None:
             # Option 1: Use same time steps for LL (simpler)
@@ -489,6 +500,15 @@ class JdmContinuousDiffusionSDE(BaseDiffusionSDE):
         
         xt_hl = alpha_hl * x0_hl + sigma_hl * eps_hl
         xt_hl = (1. - self.fix_mask_hl) * xt_hl + self.fix_mask_hl * x0_hl
+
+        # Add noise to HL discrete actions at time t_prev (for conditioning)
+        alpha_hl_prev, sigma_hl_prev = self.noise_schedule_funcs["forward"](t_hl_prev, **(self.noise_schedule_params or {}))
+        alpha_hl_prev = at_least_ndim(alpha_hl_prev, x0_hl.dim())
+        sigma_hl_prev = at_least_ndim(sigma_hl_prev, x0_hl.dim())
+        
+        # Use the same noise but with different scaling factors
+        xt_hl_prev = alpha_hl_prev * x0_hl + sigma_hl_prev * eps_hl
+        xt_hl_prev = (1. - self.fix_mask_hl) * xt_hl_prev + self.fix_mask_hl * x0_hl
         
         # Add noise to LL motion data
         alpha_ll, sigma_ll = self.noise_schedule_funcs["forward"](t_ll, **(self.noise_schedule_params or {}))
@@ -498,7 +518,7 @@ class JdmContinuousDiffusionSDE(BaseDiffusionSDE):
         xt_ll = alpha_ll * x0_ll + sigma_ll * eps_ll
         xt_ll = (1. - self.fix_mask_ll) * xt_ll + self.fix_mask_ll * x0_ll
         
-        return xt_hl, t_hl, eps_hl, xt_ll, t_ll, eps_ll
+        return xt_hl, t_hl, eps_hl, xt_hl_prev, xt_ll, t_ll, eps_ll
     
      # ==================== Training ======================
 
@@ -524,22 +544,25 @@ class JdmContinuousDiffusionSDE(BaseDiffusionSDE):
                 Loss for LL diffusion
         """
         # Add noise to both HL and LL data
-        xt_hl, t_hl, eps_hl, xt_ll, t_ll, eps_ll = self.add_noise(x0_hl, x0_ll)
+        xt_hl, t_hl, eps_hl, xt_hl_prev, xt_ll, t_ll, eps_ll = self.add_noise(x0_hl, x0_ll)
         
         # Process conditions
-        # For HL diffusion, condition could include LL information using cross-attention
-        condition_hl_embed = self.model_hl["condition"](condition_hl) if condition_hl is not None else None
-        
         # For LL diffusion, condition could include HL information using cross-attention
-        condition_ll_embed = self.model_ll["condition"](condition_ll) if condition_ll is not None else None
+        # BUG: should use xt_ll (x_t) instead of condition_hl
+        condition_ll_embed = self.model_ll["condition"](xt_ll)
+        
+        # For HL diffusion, condition could include LL information using cross-attention
+        # BUG: should use xt-1_hl instead of condition_hl
+        # It means we need to calculate or use the previous step's condition
+        condition_hl_embed = self.model_hl["condition"](xt_hl_prev) 
         
         # Calculate losses for both diffusions
         if self.predict_noise:
-            loss_hl = (self.model_hl["diffusion"](xt_hl, t_hl, condition_hl_embed) - eps_hl) ** 2
-            loss_ll = (self.model_ll["diffusion"](xt_ll, t_ll, condition_ll_embed) - eps_ll) ** 2
+            loss_hl = (self.model_hl["diffusion"](xt_hl, t_hl, condition_ll_embed) - eps_hl) ** 2
+            loss_ll = (self.model_ll["diffusion"](xt_ll, t_ll, condition_hl_embed) - eps_ll) ** 2
         else:
-            loss_hl = (self.model_hl["diffusion"](xt_hl, t_hl, condition_hl_embed) - x0_hl) ** 2
-            loss_ll = (self.model_ll["diffusion"](xt_ll, t_ll, condition_ll_embed) - x0_ll) ** 2
+            loss_hl = (self.model_hl["diffusion"](xt_hl, t_hl, condition_ll_embed) - x0_hl) ** 2
+            loss_ll = (self.model_ll["diffusion"](xt_ll, t_ll, condition_hl_embed) - x0_ll) ** 2
         
         # Apply masks and weights
         loss_hl = loss_hl * self.loss_weight_hl * (1 - self.fix_mask_hl)
@@ -817,7 +840,7 @@ class JdmContinuousDiffusionSDE(BaseDiffusionSDE):
                 # Step 1: Prepare cross-conditioning - LL conditions HL
                 # Here we use the current xt_ll to condition the denoising of yt_hl
                 condition_ll_to_hl = self.prepare_ll_condition(xt_ll) if hasattr(self, "prepare_ll_condition") else xt_ll
-                condition_vec_ll_to_hl = model_hl["condition"](condition_ll_to_hl) if model_hl["condition"] is not None else None
+                condition_vec_ll_to_hl = model_ll["condition"](condition_ll_to_hl) if model_ll["condition"] is not None else None
                 
                 # Step 2: Denoise HL with LL conditioning
                 # This gives us yt-1_hl conditioned on yt_hl and xt_ll
@@ -850,7 +873,7 @@ class JdmContinuousDiffusionSDE(BaseDiffusionSDE):
                 # Step 3: Prepare cross-conditioning - HL conditions LL
                 # Here we use the denoised yt-1_hl to condition the denoising of xt_ll
                 condition_hl_to_ll = self.prepare_hl_condition(xt_hl_prev) if hasattr(self, "prepare_hl_condition") else xt_hl_prev
-                condition_vec_hl_to_ll = model_ll["condition"](condition_hl_to_ll) if model_ll["condition"] is not None else None
+                condition_vec_hl_to_ll = model_hl["condition"](condition_hl_to_ll) if model_hl["condition"] is not None else None
                 
                 # Step 4: Denoise LL with HL conditioning
                 # This gives us xt-1_ll conditioned on xt_ll and yt-1_hl
