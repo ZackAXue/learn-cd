@@ -13,6 +13,7 @@ from cleandiffuser.utils import report_parameters, set_seed, pad_to_next_power_o
 from cleandiffuser.dataset.blocks_world_dataset import BlocksWorldDataset
 
 from cleandiffuser.diffusion import JdmContinuousDiffusionSDE
+from cleandiffuser.render.blocks_world_render import BlocksWorldRender
 from omegaconf import OmegaConf
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"  # or "true" if you want to enable it
@@ -83,20 +84,27 @@ def pipeline(args):
     # For jannner unet, we need to pad the input to the next power of 2
     ll_horizon = next_power_of_2
     # ---------------------- Network Architecture ----------------------
-    # High-level diffusion network (for discrete symbolic actions)
-    nn_diffusion_hl = JannerUNet1d(
-        args.task.bit_dim, model_dim=args.model_dim, emb_dim=args.model_dim, 
-        dim_mult=args.task.dim_mult_hl,
-        timestep_emb_type="positional", attention=True, kernel_size=5
-    )
+    if args.nn == "pearce":
+        # High-level diffusion network (for discrete symbolic actions)
+        nn_diffusion_hl = JannerUNet1d(
+            args.task.bit_dim, model_dim=args.model_dim, emb_dim=args.model_dim, 
+            dim_mult=args.task.dim_mult_hl,
+            timestep_emb_type="positional", attention=True, kernel_size=5
+        )
+        
+        # Low-level diffusion network (for continuous motion)
+        nn_diffusion_ll = JannerUNet1d(
+            args.task.motion_dim, model_dim=args.model_dim, emb_dim=args.model_dim, 
+            dim_mult=args.task.dim_mult_ll,
+            timestep_emb_type="positional", attention=True, kernel_size=5
+        )
+    elif args.nn == "dit":
+        from cleandiffuser.nn_diffusion import DiT1d
+        nn_diffusion_hl = DiT1d(
+            args.task.bit_dim, emb_dim=args.model_dim, d_model=320, n_heads=10, depth=4, timestep_emb_type="fourier").to(args.device)
+        nn_diffusion_ll = DiT1d(
+            args.task.motion_dim, emb_dim=args.model_dim, d_model=320, n_heads=10, depth=4, timestep_emb_type="fourier").to(args.device)
     
-    # Low-level diffusion network (for continuous motion)
-    nn_diffusion_ll = JannerUNet1d(
-        args.task.motion_dim, model_dim=args.model_dim, emb_dim=args.model_dim, 
-        dim_mult=args.task.dim_mult_ll,
-        timestep_emb_type="positional", attention=True, kernel_size=5
-    )
-
     # Cross-attention condition networks
     # x_ll | x_hl_emb
     nn_condition_hl_to_ll = PearceObsConditionV2(
@@ -294,7 +302,11 @@ def pipeline(args):
         # Load the trained model
         agent.load(save_path + f"jdm_diffusion_step{args.ckpt}.pt" if args.ckpt else save_path + "jdm_diffusion_final.pt")
         agent.eval()
-        
+
+        # Create result directory if it doesn't exist
+        result_dir = os.path.join(save_path, "inference_results")
+        os.makedirs(result_dir, exist_ok=True)
+
         # Sample from the validation set
         val_dataset = BlocksWorldDataset(
             data_path=args.task.val_data_path if hasattr(args.task, 'val_data_path') else args.task.data_path,
@@ -311,11 +323,34 @@ def pipeline(args):
             val_dataset, batch_size=args.eval_batch_size, shuffle=False, 
             num_workers=2, pin_memory=True
         )
+
+        # Create renderer for visualizing results
+        renderer = BlocksWorldRender(
+        tokenizer_save_path=args.task.tokenizer_save_path,
+        n_bits=args.task.bit_dim
+    )
         
         # Run inference on samples
         success_rate = 0.0
+        hl_success_rate = 0.0
+        ll_success_rate = 0.0
         total_samples = 0
-        batch_size=args.eval_batch_size
+        batch_size = args.eval_batch_size
+
+        # Create dictionaries to store results for later analysis
+        all_results = {
+            "init_discrete": [],
+            "goal_discrete": [],
+            "gt_actions": [],
+            "pred_actions": [],
+            "gt_motion": [],
+            "pred_motion": [],
+            "hl_errors": [],
+            "ll_errors": [],
+            "hl_success": [],
+            "ll_success": [],
+            "combined_success": []
+        }
         
         for batch_idx, batch in enumerate(val_dataloader):
             if batch_idx >= args.eval_num_batches:
@@ -340,7 +375,7 @@ def pipeline(args):
             segment_idx = batch["segment_idx"].to(args.device)  # (B, 8, 2)
             
             # -------------------- Prepare Inputs --------------------
-            # Prepare HL prior: (B, 33, 6)
+            # Prepare HL prior: (B, 32, 6)
             #  - We only know init (B,11,6) + goal (B,11,6), so we fill zeros for (B,8,6).
             hl_zeros = torch.zeros(batch_size, args.task.horizon, args.task.bit_dim, device=args.device)
             prior_hl = torch.cat([init_discrete, goal_discrete, hl_zeros], dim=1)  # => (B, 30, 6)
@@ -402,7 +437,7 @@ def pipeline(args):
                     all_samples_ll.append(samples_ll)
                     all_logs.append(log)
                 
-                # Select the best sample for each batch item (e.g., based on some metric)
+                # TODO: Select the best sample for each batch item (e.g., based on some metric)
                 # For this demo, we'll just use the first sample
                 best_samples_hl = all_samples_hl[0]
                 best_samples_ll = all_samples_ll[0]
@@ -415,6 +450,7 @@ def pipeline(args):
                 # Extract the trajectory part from the LL samples
                 ll_act_start = ll_obs_dim
                 # TODO: revise the horizon in reshape to more general
+                # 52 = 48 + 4[PAD]
                 sampled_ll_traj = best_samples_ll[:, ll_act_start:].reshape(batch_size, 52, args.task.motion_dim)
                 
                 # slice sampled_hl_actions and sampled_ll_traj to the original size
@@ -435,8 +471,23 @@ def pipeline(args):
                 
                 # Update statistics
                 success_rate += combined_success.sum().item()
+                hl_success_rate += hl_success.sum().item()
+                ll_success_rate += ll_success.sum().item()
                 total_samples += batch_size
-                
+
+                # Store results for later analysis
+                all_results["init_discrete"].append(init_discrete.cpu().numpy())
+                all_results["goal_discrete"].append(goal_discrete.cpu().numpy())
+                all_results["gt_actions"].append(gt_hl_actions.cpu().numpy())
+                all_results["pred_actions"].append(sampled_hl_actions.cpu().numpy())
+                all_results["gt_motion"].append(gt_ll_traj.cpu().numpy())
+                all_results["pred_motion"].append(sampled_ll_traj.cpu().numpy())
+                all_results["hl_errors"].append(hl_errors.cpu().numpy())
+                all_results["ll_errors"].append(ll_errors.cpu().numpy())
+                all_results["hl_success"].append(hl_success.cpu().numpy())
+                all_results["ll_success"].append(ll_success.cpu().numpy())
+                all_results["combined_success"].append(combined_success.cpu().numpy())
+                    
                 # Print batch results
                 print(f"Batch {batch_idx+1}/{min(len(val_dataloader), args.eval_num_batches)}:")
                 print(f"  HL Success Rate: {hl_success.mean().item():.4f}")
@@ -445,16 +496,66 @@ def pipeline(args):
                 
                 # Save visualization samples if requested
                 if args.save_samples and batch_idx < args.num_vis_batches:
-                    # Here you would implement visualization logic
-                    # For example, saving the predicted actions and trajectories
-                    pass
-        
+                    batch_dir = os.path.join(result_dir, f"batch_{batch_idx}")
+                    os.makedirs(batch_dir, exist_ok=True)
+                    
+                    # Prepare batch data for visualization
+                    batch_data = {
+                        "init_discrete": init_discrete.cpu().numpy(),
+                        "goal_discrete": goal_discrete.cpu().numpy(),
+                        "actions_discrete": gt_hl_actions.cpu().numpy(),
+                        "motion_data": gt_ll_traj.cpu().numpy()
+                    }
+                    # Prepare prediction data
+                    predictions = {
+                        "actions_discrete": sampled_hl_actions.cpu().numpy(),
+                        "motion_data": sampled_ll_traj.cpu().numpy()
+                    }
+                    # Visualize up to max_vis_samples_per_batch samples
+                    max_samples = min(batch_size, args.max_vis_samples_per_batch)
+                    
+                    # Directly use the renderer to visualize each sample without concatenation
+                    for sample_idx in range(max_samples):
+                        sample_dir = os.path.join(batch_dir, f"sample_{sample_idx}")
+                        os.makedirs(sample_dir, exist_ok=True)
+                        
+                        # Save metrics for this sample
+                        with open(os.path.join(sample_dir, "metrics.txt"), "w") as f:
+                            f.write(f"HL Error: {hl_errors[sample_idx].item():.6f}\n")
+                            f.write(f"LL Error: {ll_errors[sample_idx].item():.6f}\n")
+                            f.write(f"HL Success: {bool(hl_success[sample_idx].item())}\n")
+                            f.write(f"LL Success: {bool(ll_success[sample_idx].item())}\n")
+                            f.write(f"Combined Success: {bool(combined_success[sample_idx].item())}\n")
+                        
+                        # Visualize this sample with the enhanced renderer
+                        renderer.visualize_sample(
+                            os.path.join(sample_dir, "visualization"),
+                            init_discrete[sample_idx].cpu().numpy(),
+                            goal_discrete[sample_idx].cpu().numpy(),
+                            gt_hl_actions[sample_idx].cpu().numpy(),
+                            gt_ll_traj[sample_idx].cpu().numpy(),
+                            sampled_hl_actions[sample_idx].cpu().numpy(),
+                            sampled_ll_traj[sample_idx].cpu().numpy()
+                        )
+
+        # Save overall statistics
+        with open(os.path.join(result_dir, "overall_results.txt"), "w") as f:
+            f.write(f"Total Samples: {total_samples}\n")
+            f.write(f"HL Success Rate: {hl_success_rate / total_samples:.4f}\n")
+            f.write(f"LL Success Rate: {ll_success_rate / total_samples:.4f}\n")
+            f.write(f"Combined Success Rate: {success_rate / total_samples:.4f}\n")
+    
         # Print overall results
         if total_samples > 0:
-            print(f"Overall Success Rate: {success_rate / total_samples:.4f}")
+            print(f"Overall HL Success Rate: {hl_success_rate / total_samples:.4f}")
+            print(f"Overall LL Success Rate: {ll_success_rate / total_samples:.4f}")
+            print(f"Overall Combined Success Rate: {success_rate / total_samples:.4f}")
             if args.enable_wandb:
-                wandb.log({"overall_success_rate": success_rate / total_samples})
-
+                wandb.log({
+                    "overall_hl_success_rate": hl_success_rate / total_samples,
+                    "overall_ll_success_rate": ll_success_rate / total_samples,
+                    "overall_combined_success_rate": success_rate / total_samples
+                })
         if args.enable_wandb:
                 wandb.finish()
     else:

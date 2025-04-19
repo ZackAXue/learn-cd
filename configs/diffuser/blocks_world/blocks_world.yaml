@@ -1,16 +1,16 @@
 project: blocks_world
 group: jdm
-name: jdm_blocks_world
+name: jdm_dit_blocks_world
 seed: 0
-mode: inference  # train or inference
+mode: train  # train or inference
 enable_wandb : false
 pipeline_name: jdm_blocks_world
 device: cuda:0
 discount: 0.99
-batch_size: 16
-epochs: 10
+batch_size: 32
+epochs: 50
 log_interval: 100
-save_interval: 1000
+save_interval: 20000
 
 # Training Parameters
 lr_hl: 1e-4
@@ -28,6 +28,7 @@ ll_action_loss_weight: 2.0
 expected_sample_steps : 50
 
 # Model Parameters
+nn: dit
 model_dim: 128
 noise_schedule: cosine
 predict_noise: false
@@ -42,19 +43,20 @@ w_cfg_ll: 0.5  # Classifier-free guidance weight for LL
 preserve_history: true
 
 # Evaluation Parameters
-ckpt: 1000  # Checkpoint to load, null for final model
+ckpt: 200000  # Checkpoint to load, null for final model
 eval_batch_size: 16
 eval_num_batches: 10
-num_samples_per_inference: 5
+num_samples_per_inference: 1
 hl_success_threshold: 0.1
-ll_success_threshold: 0.05
+ll_success_threshold: 0.1
 save_samples: true
 num_vis_batches: 2
+max_vis_samples_per_batch: 2
 
 task:
   env_name: blocks_world
   data_path: "dev/blocksworld/tamp_train_dataset.json"
-  val_data_path: "dev/blocksworld/tamp_test_dataset.json"
+  val_data_path: "dev/blocksworld/tamp_train_dataset.json"
   tokenizer_save_path: "dev/blocksworld/blocks_tokenizer"
   horizon: 8  # Number of high-level actions
   steps_per_action: 6  # Number of motion steps per action
