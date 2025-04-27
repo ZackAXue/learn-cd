@@ -43,9 +43,15 @@ def pipeline(args):
 
     set_seed(args.seed)
     
-    save_path = f'results/{args.pipeline_name}/{args.task.env_name}/'
+    save_path = f'results/{args.name}/{args.task.env_name}/'
     if not os.path.exists(save_path):
         os.makedirs(save_path)
+
+    if args.mode == "train":
+        config_path = os.path.join(save_path, 'config.yaml')
+        with open(config_path, 'w') as f:
+            OmegaConf.save(args, f)
+        print(f"[BlcoksWorldTrain] Configuration saved to {config_path}")
 
     # ---------------------- Create Dataset ----------------------
     dataset = BlocksWorldDataset(
@@ -101,9 +107,9 @@ def pipeline(args):
     elif args.nn == "dit":
         from cleandiffuser.nn_diffusion import DiT1d
         nn_diffusion_hl = DiT1d(
-            args.task.bit_dim, emb_dim=args.model_dim, d_model=320, n_heads=10, depth=4, timestep_emb_type="fourier").to(args.device)
+            args.task.bit_dim, emb_dim=args.model_dim, d_model=320, n_heads=args.n_heads_HL, depth=args.depth_HL, timestep_emb_type="fourier").to(args.device)
         nn_diffusion_ll = DiT1d(
-            args.task.motion_dim, emb_dim=args.model_dim, d_model=320, n_heads=10, depth=4, timestep_emb_type="fourier").to(args.device)
+            args.task.motion_dim, emb_dim=args.model_dim, d_model=320, n_heads=args.n_heads_LL, depth=args.depth_LL, timestep_emb_type="fourier").to(args.device)
     
     # Cross-attention condition networks
     # x_ll | x_hl_emb
@@ -178,119 +184,118 @@ def pipeline(args):
     # ---------------------- Training ----------------------
     if args.mode == "train":
         # Create learning rate schedulers
-        diffusion_hl_lr_scheduler = CosineAnnealingLR(agent.optimizer_hl, args.diffusion_gradient_steps)
-        diffusion_ll_lr_scheduler = CosineAnnealingLR(agent.optimizer_ll, args.diffusion_gradient_steps)
+        diffusion_hl_lr_scheduler = CosineAnnealingLR(agent.optimizer_hl, args.max_train_steps)
+        diffusion_ll_lr_scheduler = CosineAnnealingLR(agent.optimizer_ll, args.max_train_steps)
 
         agent.train()
 
         n_gradient_step = 0
         log = {"avg_loss_hl": 0., "avg_loss_ll": 0., "avg_loss_combined": 0.}
+        
+        #load model from checkpoint if provided
+        if args.load_checkpoint_train:
+            agent.load(save_path + f"jdm_diffusion_step{args.ckpt}.pt" if args.ckpt else save_path + "jdm_diffusion_final.pt")
+            n_gradient_step = args.ckpt
+            print(f"[BlocksWorldTrain] Loaded checkpoint from {save_path + f'jdm_diffusion_step{args.ckpt}.pt' if args.ckpt else save_path + 'jdm_diffusion_final.pt'}")
 
-
-        for epoch in range(args.epochs):
-            print(f"Epoch {epoch+1}/{args.epochs}")
+        for batch in loop_dataloader(dataloader):
+            # -------------------- Process Batch --------------------
+            # Process high-level components
+            init_discrete = batch["obs"]["init_discrete"].to(args.device)  # (B, 11, 6)
+            goal_discrete = batch["obs"]["goal_discrete"].to(args.device)  # (B, 11, 6)
+            hl_actions = batch["hl_discrete_action_seq"].to(args.device)  # (B, 8, 6)
             
-            for batch in loop_dataloader(dataloader):
-                # -------------------- Process Batch --------------------
-                # Process high-level components
-                init_discrete = batch["obs"]["init_discrete"].to(args.device)  # (B, 11, 6)
-                goal_discrete = batch["obs"]["goal_discrete"].to(args.device)  # (B, 11, 6)
-                hl_actions = batch["hl_discrete_action_seq"].to(args.device)  # (B, 8, 6)
-                
-                # Process low-level components
-                init_coords_block = batch["obs"]["init_coords_block"].to(args.device)  # (B, 5, 2)
-                goal_coords_block = batch["obs"]["goal_coords_block"].to(args.device)  # (B, 5, 2)
-                init_coords_ee = batch["obs"]["init_coords_ee"].to(args.device).unsqueeze(1)  # (B, 1, 2)
-                goal_coords_ee = batch["obs"]["goal_coords_ee"].to(args.device).unsqueeze(1)  # (B, 1, 2)
-                ll_traj = batch["ll_traj"].to(args.device)  # (B, 48, 3)
-                
-                # Process segment indices (might be needed for future conditioning)
-                segment_idx = batch["segment_idx"].to(args.device)  # (B, 8, 2)
-                
-                # -------------------- Prepare Inputs --------------------
-                batch_size = init_discrete.shape[0]
+            # Process low-level components
+            init_coords_block = batch["obs"]["init_coords_block"].to(args.device)  # (B, 5, 2)
+            goal_coords_block = batch["obs"]["goal_coords_block"].to(args.device)  # (B, 5, 2)
+            init_coords_ee = batch["obs"]["init_coords_ee"].to(args.device).unsqueeze(1)  # (B, 1, 2)
+            goal_coords_ee = batch["obs"]["goal_coords_ee"].to(args.device).unsqueeze(1)  # (B, 1, 2)
+            ll_traj = batch["ll_traj"].to(args.device)  # (B, 48, 3)
+            
+            # Process segment indices (might be needed for future conditioning)
+            segment_idx = batch["segment_idx"].to(args.device)  # (B, 8, 2)
+            
+            # -------------------- Prepare Inputs --------------------
+            batch_size = init_discrete.shape[0]
 
-                # High-level: (B, 11, 6) + (B, 11, 6) + (B, 8, 6) ==> (B, 30, 6)
-                # CHANGED ↓↓↓ -- no flatten, no unsqueeze
-                x0_hl = torch.cat([init_discrete, goal_discrete, hl_actions], dim=1)  # shape: (B, 11+11+8=30, 6)
+            # High-level: (B, 11, 6) + (B, 11, 6) + (B, 8, 6) ==> (B, 30, 6)
+            # CHANGED ↓↓↓ -- no flatten, no unsqueeze
+            x0_hl = torch.cat([init_discrete, goal_discrete, hl_actions], dim=1)  # shape: (B, 11+11+8=30, 6)
 
-                # Low-level: we want (B, 60, 3) total
-                #   each part is (B, #segments, 3), then cat along dim=1
-                time_dim = torch.zeros(batch_size, args.task.max_blocks, 1, device=args.device)
-                # (B, 5, 2) -> add time => (B, 5, 3)
-                init_coords_block_with_time = torch.cat([time_dim, init_coords_block], dim=2)
-                goal_coords_block_with_time = torch.cat([time_dim, goal_coords_block], dim=2)
+            # Low-level: we want (B, 60, 3) total
+            #   each part is (B, #segments, 3), then cat along dim=1
+            time_dim = torch.zeros(batch_size, args.task.max_blocks, 1, device=args.device)
+            # (B, 5, 2) -> add time => (B, 5, 3)
+            init_coords_block_with_time = torch.cat([time_dim, init_coords_block], dim=2)
+            goal_coords_block_with_time = torch.cat([time_dim, goal_coords_block], dim=2)
 
-                # (B, 1, 2) -> add time => (B, 1, 3)
-                init_coords_ee_with_time = torch.cat([
-                    torch.zeros(batch_size, 1, 1, device=args.device),
-                    init_coords_ee
-                ], dim=2)
-                # we use time = 0 for the goal ee coords
-                goal_coords_ee_with_time = torch.cat([
-                    torch.zeros(batch_size, 1, 1, device=args.device),
-                    goal_coords_ee
-                ], dim=2)
+            # (B, 1, 2) -> add time => (B, 1, 3)
+            init_coords_ee_with_time = torch.cat([
+                torch.zeros(batch_size, 1, 1, device=args.device),
+                init_coords_ee
+            ], dim=2)
+            # we use time = 0 for the goal ee coords
+            goal_coords_ee_with_time = torch.cat([
+                torch.zeros(batch_size, 1, 1, device=args.device),
+                goal_coords_ee
+            ], dim=2)
 
-                # CHANGED ↓↓↓ -- no flatten, no unsqueeze
-                # Now simply cat along dim=1 to get (B, 60, 3)
-                x0_ll = torch.cat([
-                    init_coords_block_with_time,    # (B, 5, 3)
-                    goal_coords_block_with_time,    # (B, 5, 3)
-                    init_coords_ee_with_time,       # (B, 1, 3)
-                    goal_coords_ee_with_time,       # (B, 1, 3)
-                    ll_traj                         # (B, 50, 3)
-                ], dim=1)  # => shape (B, 60, 3)
-                # -------------------- Update Model --------------------
-                # Compute weights for this batch (can adjust based on training progress)
-                hl_weight = args.hl_weight
-                ll_weight = args.ll_weight
-                
-                # Perform gradient update (we're using inpainting via masks, so no explicit condition)
-                update_log = agent.update(
-                    x0_hl=x0_hl, 
-                    x0_ll=x0_ll,
-                    condition_hl=None,  # Using inpainting for fixed parts
-                    condition_ll=None,  # Using inpainting for fixed parts
-                    update_ema=True,
-                    hl_weight=hl_weight,
-                    ll_weight=ll_weight,
-                    update_both=True
-                )
-                
-                # Update learning rate schedulers
-                diffusion_hl_lr_scheduler.step()
-                diffusion_ll_lr_scheduler.step()
-                
-                # Update logs
-                log["avg_loss_hl"] += update_log["loss_hl"]
-                log["avg_loss_ll"] += update_log["loss_ll"]
-                log["avg_loss_combined"] += update_log["loss_combined"]
-                
-                # -------------------- Logging and Saving --------------------
-                n_gradient_step += 1
-                
-                # Log periodically
-                if n_gradient_step % args.log_interval == 0:
-                    log["gradient_steps"] = n_gradient_step
-                    log["avg_loss_hl"] /= args.log_interval
-                    log["avg_loss_ll"] /= args.log_interval
-                    log["avg_loss_combined"] /= args.log_interval
-                    print(f"Step {n_gradient_step}: {log}")
-                    if args.enable_wandb:
-                        wandb.log(log, step=n_gradient_step + 1)
-                    log = {"avg_loss_hl": 0., "avg_loss_ll": 0., "avg_loss_combined": 0.}
-                
-                # Save periodically
-                if n_gradient_step % args.save_interval == 0:
-                    agent.save_checkpoint(save_path + f"jdm_diffusion", n_gradient_step, log)
-                
-                # Break if we've reached the maximum number of gradient steps
-                if n_gradient_step >= args.diffusion_gradient_steps:
-                    break
+            # CHANGED ↓↓↓ -- no flatten, no unsqueeze
+            # Now simply cat along dim=1 to get (B, 60, 3)
+            x0_ll = torch.cat([
+                init_coords_block_with_time,    # (B, 5, 3)
+                goal_coords_block_with_time,    # (B, 5, 3)
+                init_coords_ee_with_time,       # (B, 1, 3)
+                goal_coords_ee_with_time,       # (B, 1, 3)
+                ll_traj                         # (B, 50, 3)
+            ], dim=1)  # => shape (B, 60, 3)
+            # -------------------- Update Model --------------------
+            # Compute weights for this batch (can adjust based on training progress)
+            hl_weight = args.hl_weight
+            ll_weight = args.ll_weight
+            
+            # Perform gradient update (we're using inpainting via masks, so no explicit condition)
+            update_log = agent.update(
+                x0_hl=x0_hl, 
+                x0_ll=x0_ll,
+                condition_hl=None,  # Using inpainting for fixed parts
+                condition_ll=None,  # Using inpainting for fixed parts
+                update_ema=True,
+                hl_weight=hl_weight,
+                ll_weight=ll_weight,
+                update_both=True
+            )
+            
+            # Update learning rate schedulers
+            diffusion_hl_lr_scheduler.step()
+            diffusion_ll_lr_scheduler.step()
+            
+            # Update logs
+            log["avg_loss_hl"] += update_log["loss_hl"]
+            log["avg_loss_ll"] += update_log["loss_ll"]
+            log["avg_loss_combined"] += update_log["loss_combined"]
+            
+            # -------------------- Logging and Saving --------------------
+            n_gradient_step += 1
+            
+            # Log periodically
+            if n_gradient_step % args.log_interval == 0:
+                log["gradient_steps"] = n_gradient_step
+                log["avg_loss_hl"] /= args.log_interval
+                log["avg_loss_ll"] /= args.log_interval
+                log["avg_loss_combined"] /= args.log_interval
+                print(f"Step {n_gradient_step}: {log}")
+                if args.enable_wandb:
+                    wandb.log(log, step=n_gradient_step + 1)
+                log = {"avg_loss_hl": 0., "avg_loss_ll": 0., "avg_loss_combined": 0.}
+            
+            # Save periodically
+            if n_gradient_step % args.save_interval == 0:
+                agent.save_checkpoint(save_path + f"jdm_diffusion", n_gradient_step, log)
             
             # Break if we've reached the maximum number of gradient steps
-            if n_gradient_step >= args.diffusion_gradient_steps:
+            if n_gradient_step >= args.max_train_steps:
+                print(f"Training completed after {n_gradient_step} gradient steps.")
                 break
         
         # Save final model

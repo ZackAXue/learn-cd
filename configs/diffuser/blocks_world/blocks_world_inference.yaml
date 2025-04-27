@@ -2,8 +2,8 @@ project: blocks_world
 group: jdm
 name: jdm_blocks_world
 seed: 0
-mode: train  # train or inference
-enable_wandb : true
+mode: inference  # train or inference
+enable_wandb : false
 pipeline_name: jdm_blocks_world
 device: cuda:0
 discount: 0.99
@@ -18,7 +18,7 @@ lr_ll: 1e-4
 weight_decay: 1e-6
 grad_clip_norm: 1.0
 # For CosineAnnealingLR
-diffusion_gradient_steps: 200000
+max_train_steps: 200000
 ema_rate: 0.999
 hl_weight: 1.0
 ll_weight: 1.0
@@ -31,6 +31,7 @@ expected_sample_steps : 50
 model_dim: 128
 noise_schedule: cosine
 predict_noise: false
+nn: pearce
 
 # Sampling Parameters
 solver: ddpm
