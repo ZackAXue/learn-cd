@@ -533,6 +533,7 @@ def pipeline(args):
                             f.write(f"Combined Success: {bool(combined_success[sample_idx].item())}\n")
                         
                         # Visualize this sample with the enhanced renderer
+                        # BUG: There is a bug on HL actions visualization, all the decoded token is None
                         renderer.visualize_sample(
                             os.path.join(sample_dir, "visualization"),
                             init_discrete[sample_idx].cpu().numpy(),

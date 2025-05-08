@@ -4,9 +4,9 @@ name: jdm_dit_blocks_world_15_v2
 seed: 0
 
 # General Parameters
-mode: train  # train or inference
-enable_wandb : true
-device: cuda:1
+mode: inference  # train or inference
+enable_wandb : false
+device: cuda:0
 ckpt: 200000  # Checkpoint to load, null for final model
 discount: 0.99
 batch_size: 32

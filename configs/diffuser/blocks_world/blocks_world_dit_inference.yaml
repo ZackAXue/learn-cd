@@ -46,15 +46,15 @@ w_cfg_ll: 0.5  # Classifier-free guidance weight for LL
 preserve_history: true
 
 # Evaluation Parameters
-ckpt: 200000  # Checkpoint to load, null for final model
+ckpt: 400000  # Checkpoint to load, null for final model
 eval_batch_size: 16
 eval_num_batches: 10
 num_samples_per_inference: 1
 hl_success_threshold: 0.1
 ll_success_threshold: 0.1
 save_samples: true
-num_vis_batches: 2
-max_vis_samples_per_batch: 2
+num_vis_batches: 4
+max_vis_samples_per_batch: 4
 
 task:
   env_name: blocks_world
